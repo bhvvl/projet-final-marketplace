@@ -1,0 +1,27 @@
+=== Run 1
+DagRun Finished: dag_id=marketplace_orders_ingest_daily, logical_date=2026-04-07 00:00:00+00:00, run_id=manual__2026-10-21T09:39:10.426251+00:00, run_start_date=2026-04-07 00:00:00+00:00, run_end_date=2026-10-21 09:39:16.680119+00:00, run_duration=17055556.680119, state=success
+Marking run <DagRun marketplace_orders_ingest_daily @ 2026-04-07 00:00:00+00:00: manual__2026-10-21T09:39:10.426251+00:00, state:running, queued_at: None. run_type: manual> successful [airflow.models.dagrun.DagRun] loc=dagrun.py:1205
+state=success
+ fact_rows | staging_rows | dim_product_rows |   total   |             checksum             
+-----------+--------------+------------------+-----------+----------------------------------
+      1011 |         1011 |             3001 | 143426.40 | 04b5d5f2ac91f435294c9c376ed2a97c
+(1 row)
+
+=== Run 2
+DagRun Finished: dag_id=marketplace_orders_ingest_daily, logical_date=2026-04-07 00:00:00+00:00, run_id=manual__2026-10-21T09:39:20.631204+00:00, run_start_date=2026-04-07 00:00:00+00:00, run_end_date=2026-10-21 09:39:26.722398+00:00, run_duration=17055566.722398, state=success
+Marking run <DagRun marketplace_orders_ingest_daily @ 2026-04-07 00:00:00+00:00: manual__2026-10-21T09:39:20.631204+00:00, state:running, queued_at: None. run_type: manual> successful [airflow.models.dagrun.DagRun] loc=dagrun.py:1205
+state=success
+ fact_rows | staging_rows | dim_product_rows |   total   |             checksum             
+-----------+--------------+------------------+-----------+----------------------------------
+      1011 |         1011 |             3001 | 143426.40 | 04b5d5f2ac91f435294c9c376ed2a97c
+(1 row)
+
+=== Run 3
+DagRun Finished: dag_id=marketplace_orders_ingest_daily, logical_date=2026-04-07 00:00:00+00:00, run_id=manual__2026-10-21T09:39:30.822794+00:00, run_start_date=2026-04-07 00:00:00+00:00, run_end_date=2026-10-21 09:39:36.566313+00:00, run_duration=17055576.566313, state=success
+Marking run <DagRun marketplace_orders_ingest_daily @ 2026-04-07 00:00:00+00:00: manual__2026-10-21T09:39:30.822794+00:00, state:running, queued_at: None. run_type: manual> successful [airflow.models.dagrun.DagRun] loc=dagrun.py:1205
+state=success
+ fact_rows | staging_rows | dim_product_rows |   total   |             checksum             
+-----------+--------------+------------------+-----------+----------------------------------
+      1011 |         1011 |             3001 | 143426.40 | 04b5d5f2ac91f435294c9c376ed2a97c
+(1 row)
+

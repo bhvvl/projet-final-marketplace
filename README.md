@@ -76,6 +76,50 @@ Choix :
 - Retry avec backoff exponentiel sur timeout, connexion refusée et 429/5xx (3 retries par défaut). 400/401 échouent immédiatement.
 - Tests : [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) — serveur HTTP local scripté pour tester le retry réellement, plus un test de déterminisme contre l'API du compose.
 
+## DAG `marketplace_orders_ingest_daily`
+
+[dags/marketplace_orders_ingest_daily.py](dags/marketplace_orders_ingest_daily.py)
+
+```mermaid
+flowchart LR
+    eo["extract_orders_to_raw<br/>API → MinIO raw/orders/dt="] --> lo["load_orders_staging<br/>MinIO → staging.orders"]
+    er["extract_referentials_to_raw<br/>API → MinIO raw/sellers|products|customers/dt="] --> ld["load_dims<br/>staging + UPSERT dims"]
+    lo --> tf["transform_fact_orders<br/>DELETE + INSERT dt = ds"]
+    ld --> tf
+    tf -. "Asset fact_orders" .-> aval["DAGs aval (analytics)"]
+```
+
+- **Planification** : `CronDataIntervalTimetable("@daily")`. En Airflow 3, `schedule="@daily"` seul donne `ds` = jour du run (journée incomplète). Avec un data interval, le run de J traite la journée complète J-1.
+- **Raw d'abord** : les chargements relisent le JSON archivé dans MinIO, pas l'API ni les XCom. Une transformation corrigée se rejoue sans rappeler la source, et aucun gros volume ne passe par les XCom.
+- **Idempotence** :
+  - raw : la partition `dt=` est écrasée ;
+  - `staging.orders` et `dwh.fact_orders` : `DELETE` + `INSERT` de la partition dans une seule transaction ;
+  - dimensions : UPSERT.
+- **Contrôle** : `load_orders_staging` échoue si le nombre de lignes chargées diffère du nombre extrait.
+- `retries=2`, `max_active_runs=1`, `catchup=False`.
+- SQL : [dags/sql/](dags/sql/). Code partagé : [dags/marketplace/common.py](dags/marketplace/common.py) (exclus du parsing par `.airflowignore`).
+
+### Preuve d'idempotence (2026-04-07)
+
+Trois `airflow dags test marketplace_orders_ingest_daily 2026-04-07` successifs, en succès, donnent un contenu strictement identique ([docs/idempotence-2026-04-07.txt](docs/idempotence-2026-04-07.txt)) :
+
+| Run | `fact_orders` | `staging.orders` | `dim_product` | Somme `total_amount` | MD5 du contenu |
+|---|---|---|---|---|---|
+| 1 | 1 011 | 1 011 | 3 001 | 143 426,40 | `04b5d5f2ac91f435294c9c376ed2a97c` |
+| 2 | 1 011 | 1 011 | 3 001 | 143 426,40 | `04b5d5f2ac91f435294c9c376ed2a97c` |
+| 3 | 1 011 | 1 011 | 3 001 | 143 426,40 | `04b5d5f2ac91f435294c9c376ed2a97c` |
+
+## Tests
+
+```bash
+docker compose exec airflow-worker pytest tests/ -v
+```
+
+| Fichier | Tests |
+|---|---|
+| [tests/test_dags.py](tests/test_dags.py) | `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction), structure du DAG, et `test_transform_is_idempotent_on_dwh` qui joue 2 fois la transformation sur le DWH et compare les empreintes (ignoré si le DWH est vide) |
+| [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) | 12 tests du Hook |
+
 ## Lancement
 
 ```bash
