@@ -173,3 +173,37 @@ def test_quality_branch_routes_to_dwh_or_alert(ingest_dag, passed, expected):
     branch = ingest_dag.get_task("check_quality").python_callable
 
     assert branch({"passed": passed, "checks": []}) == expected
+
+
+# --------------------------------------------------------------------- anomalies
+
+ANOMALY_DAG_ID = "marketplace_anomaly_detect_daily"
+
+
+@pytest.fixture(scope="module")
+def anomaly_dag(dagbag):
+    dag = dagbag.get_dag(ANOMALY_DAG_ID)
+    assert dag is not None, f"DAG {ANOMALY_DAG_ID} introuvable"
+    return dag
+
+
+def test_anomaly_dag_is_triggered_by_fact_orders_and_branches(anomaly_dag):
+    uris = [asset.uri for _, asset in anomaly_dag.timetable.asset_condition.iter_assets()]
+    assert uris == ["postgres://postgres-dwh:5432/dwh/dwh/fact_orders"]
+    assert anomaly_dag.get_task("check_anomalies").downstream_task_ids == {"notify_anomalies", "no_anomaly"}
+    assert anomaly_dag.params["threshold"] == 0.7  # US-05 : CA < 70 % de la moyenne 7 jours
+
+
+@pytest.mark.parametrize("anomalies, expected", [([{"scope": "global"}], "notify_anomalies"), ([], "no_anomaly")])
+def test_anomaly_branch(anomaly_dag, anomalies, expected):
+    branch = anomaly_dag.get_task("check_anomalies").python_callable
+
+    assert branch({"anomalies": anomalies, "latest": "2026-10-20"}) == expected
+
+
+def test_anomaly_sql_is_idempotent():
+    sql = re.sub(r"--[^\n]*", "", (Path(__file__).resolve().parents[1] / "dags" / "sql" / "anomaly_detect.sql").read_text())
+
+    delete = re.search(r"DELETE\s+FROM\s+analytics\.anomalies\s+WHERE\s+dt\s*=\s*%\(dt\)s", sql)
+    inserts = [m.start() for m in re.finditer(r"INSERT\s+INTO\s+analytics\.anomalies", sql)]
+    assert delete and len(inserts) == 3 and delete.start() < min(inserts)

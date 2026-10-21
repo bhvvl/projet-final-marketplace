@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
-from marketplace.common import DWH_CONN_ID, FACT_ORDERS_ASSET, read_sql
+from marketplace.common import DWH_CONN_ID, FACT_ORDERS_ASSET, dates_to_process, read_sql
 
 AGGREGATES = {
     "build_daily_summary": "analytics_daily_summary.sql",
@@ -39,19 +39,7 @@ AGGREGATES = {
 def marketplace_analytics_aggregate_daily():
     @task
     def resolve_dates(**context) -> list[str]:
-        events = [e for asset_events in (context.get("triggering_asset_events") or {}).values() for e in asset_events]
-        dates = {(event.extra or {}).get("dt") for event in events}
-        if events and None not in dates:
-            print(f"{len(events)} événement(s) d'Asset : {sorted(dates)}")
-            return sorted(dates)
-
-        from airflow.providers.postgres.hooks.postgres import PostgresHook
-
-        rows = PostgresHook(postgres_conn_id=DWH_CONN_ID).get_records(
-            "SELECT DISTINCT dt::text FROM dwh.fact_orders ORDER BY 1"
-        )
-        print(f"Pas de date dans les événements d'Asset : recalcul complet ({len(rows)} dates)")
-        return [row[0] for row in rows]
+        return dates_to_process(context)
 
     @task
     def build_aggregate(sql_file: str, dates: list[str]) -> int:

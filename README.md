@@ -84,10 +84,13 @@ Choix :
 flowchart LR
     eo["extract_orders_to_raw<br/>API → MinIO raw/orders/dt="] --> lo["load_orders_staging<br/>MinIO → staging.orders"]
     er["extract_referentials_to_raw<br/>API → MinIO raw/sellers|products|customers/dt="] --> ld["load_dims<br/>staging + UPSERT dims"]
-    lo --> tf["transform_fact_orders<br/>DELETE + INSERT dt = ds"]
+    lo --> dq["dq_staging_orders<br/>DataQualityOperator"]
+    dq --> br{"check_quality"}
+    br -- "KO" --> alert["alert_dq_failed<br/>webhook + run en échec"]
+    br -- "OK" --> tf["transform_fact_orders<br/>DELETE + INSERT dt = ds"]
     ld --> tf
     tf --> pub["publish_fact_orders<br/>Asset fact_orders, extra {dt}"]
-    pub -. "déclenche" .-> aval["marketplace_analytics_aggregate_daily"]
+    pub -. "déclenche" .-> aval["analytics + anomalies"]
 ```
 
 - **Planification** : `CronDataIntervalTimetable("@daily")`. En Airflow 3, `schedule="@daily"` seul donne `ds` = jour du run (journée incomplète). Avec un data interval, le run de J traite la journée complète J-1.
@@ -97,6 +100,7 @@ flowchart LR
   - `staging.orders` et `dwh.fact_orders` : `DELETE` + `INSERT` de la partition dans une seule transaction ;
   - dimensions : UPSERT.
 - **Contrôle** : `load_orders_staging` échoue si le nombre de lignes chargées diffère du nombre extrait.
+- **Qualité (bonus)** : voir [Qualité de données et branching](#qualité-de-données-et-branching-bonus).
 - `retries=2`, `max_active_runs=1`, `catchup=False`.
 - SQL : [dags/sql/](dags/sql/). Code partagé : [dags/marketplace/common.py](dags/marketplace/common.py) (exclus du parsing par `.airflowignore`).
 
@@ -112,6 +116,32 @@ Trois `airflow dags test marketplace_orders_ingest_daily 2026-04-07` successifs,
 
 > ⚠️ **`airflow dags test` exige le DAG en pause.** Sur un DAG actif, le scheduler prend aussi en charge le run créé par `dags test` et les deux se disputent les tâches (erreur `ServerResponseError` au démarrage des tâches). Pour rejouer une date sur un DAG actif, utiliser plutôt `airflow dags trigger marketplace_orders_ingest_daily --logical-date 2026-04-07T00:00:00+00:00`.
 
+## Qualité de données et branching (bonus)
+
+[plugins/operators/data_quality_operator.py](plugins/operators/data_quality_operator.py) : `DataQualityOperator`, des règles SQL configurables qui comptent chacune les lignes en violation.
+
+| Règle | Configuration | Échoue si |
+|---|---|---|
+| `not_empty` | — | la partition est vide |
+| `not_null` | `columns: [...]` | une des colonnes est nulle |
+| `no_future_date` | `column` | une date est postérieure à maintenant |
+
+- Une configuration invalide (règle inconnue, paramètre manquant, nom de colonne suspect) fait échouer l'import du DAG, pas l'exécution.
+- Le rapport `{"passed": …, "checks": [...]}` est renvoyé en XCom ; `fail_on_error=True` fait échouer la tâche à la place.
+- Dans le DAG d'ingestion, il contrôle `staging.orders` sur `dt = '{{ ds }}'` :
+  - **OK** : `check_quality` oriente vers `transform_fact_orders` ;
+  - **KO** : `alert_dq_failed` envoie une alerte au webhook et fait échouer le run, sans retry. `fact_orders` n'est pas touché et aucun événement d'Asset n'est émis.
+- **Vérifié** : le 20/10 passe par le chemin OK. Une date future (25/10, liste vide côté API) passe par le chemin KO : `not_empty` échoue, l'alerte arrive au webhook et le run échoue.
+- `customer_id` n'est pas contrôlé : il est nul pour environ 0,2 % des commandes, rattachées au membre `UNKNOWN`.
+
+**Webhook d'alerte** : Connection `alert_webhook` (`host` = URL, `password` = token Bearer). En local, c'est l'API simulée qui reçoit les alertes (`POST /webhook`) ; on les relit avec :
+
+```bash
+curl -H "Authorization: Bearer formation-token-2026" http://localhost:5000/webhook/alerts
+```
+
+Passer à Slack ou Teams ne demande que de changer la Connection.
+
 ## DAG `marketplace_analytics_aggregate_daily`
 
 [dags/marketplace_analytics_aggregate_daily.py](dags/marketplace_analytics_aggregate_daily.py) : `resolve_dates`, puis `build_daily_summary`, `build_seller_daily` et `build_category_daily` en parallèle.
@@ -122,6 +152,27 @@ Trois `airflow dags test marketplace_orders_ingest_daily 2026-04-07` successifs,
 - `DELETE` + `INSERT` par date dans une transaction ([dags/sql/analytics_*.sql](dags/sql/)) : idempotent.
 - **Réconciliation** : le CA de `fact_orders` (commandes `completed`) est égal au centime près à celui de `daily_summary`, `seller_daily` et `category_daily`, ce que vérifie un test.
 
+## DAG `marketplace_anomaly_detect_daily` (bonus)
+
+[dags/marketplace_anomaly_detect_daily.py](dags/marketplace_anomaly_detect_daily.py) : `resolve_dates`, puis `detect_anomalies`, puis `check_anomalies`, qui oriente vers `notify_anomalies` (webhook) ou `no_anomaly`.
+
+| Type (`scope`) | Règle (seuils dans `params`) |
+|---|---|
+| `global` | CA du jour < 70 % de la moyenne des 7 jours précédents (US-05) |
+| `seller` | même règle par vendeur, pour les vendeurs dont la moyenne 7 jours dépasse 1 500 € (sinon trop de bruit) |
+| `price` | prix unitaire > 3× ou < 0,2× le prix catalogue |
+
+- Résultats dans `analytics.anomalies`, en `DELETE` + `INSERT` par date ([dags/sql/anomaly_detect.sql](dags/sql/anomaly_detect.sql)).
+- Calculé sur `fact_orders`, pas sur `analytics.*` : aucune dépendance à l'ordre des DAGs déclenchés par le même Asset.
+- Il faut au moins 4 jours chargés parmi les 7 précédents pour conclure.
+- **Planification** : par l'Asset `fact_orders`, et non `@daily` comme suggéré dans le cahier des charges. La détection part dès que les données du jour sont chargées, sans risquer de tourner avant elles.
+- **Notification** : seule la date la plus récente traitée est notifiée, pour éviter une rafale d'alertes pendant un backfill.
+- **Résultats sur les 51 jours chargés** :
+  - les 2 journées de chute simulées par l'API sont détectées (05/09 à 62 % de la moyenne, 14/09 à 47 %) ;
+  - 206 prix suspects, environ 0,4 % des commandes, soit le taux de défauts injecté dans l'API ;
+  - 133 chutes de CA vendeur.
+- ⚠️ **Après un backfill**, la référence sur 7 jours de certaines dates change. Relancer alors un recalcul complet : `airflow dags trigger marketplace_anomaly_detect_daily` (sans événement, toutes les dates sont recalculées).
+
 ## Backfill (rejouer des dates passées)
 
 Backfill Airflow 3, exécuté par le scheduler (le DAG doit être actif) :
@@ -131,7 +182,7 @@ docker compose exec airflow-worker airflow backfill create --dag-id marketplace_
   --from-date 2026-09-21 --to-date 2026-10-20 --dry-run   # puis sans --dry-run
 ```
 
-Exécuté sur 30 jours (du 21/09 au 20/10/2026) : 30 runs en succès, 33 267 commandes dans `fact_orders` (avec le 07/04), 4,35 M€ de CA. Chaque run émet un événement d'Asset, ce qui relance les agrégats.
+Exécuté en deux fois, du 21/09 au 20/10, puis du 01/09 au 20/09/2026 : 50 runs en succès. `fact_orders` contient 52 936 commandes sur 51 dates (avec le 07/04), pour 6,98 M€ de CA. Chaque run émet un événement d'Asset, qui relance les agrégats et la détection d'anomalies.
 
 ## Metabase
 
@@ -147,7 +198,7 @@ Le script :
 - crée le compte admin au premier lancement ;
 - déclare la source `postgres-dwh:5432` (nom Docker et port interne) ;
 - applique les formats français ;
-- crée ou met à jour, par leur nom, 9 questions SQL et 2 dashboards dans la collection « Maelys Marketplace ».
+- crée ou met à jour, par leur nom, 21 questions SQL et 5 dashboards dans la collection « Maelys Marketplace ».
 
 À relancer après un `docker compose down -v`, qui efface la base H2 de Metabase.
 
@@ -157,9 +208,15 @@ Les KPIs sont calculés par rapport au **dernier jour chargé** (`max(dt)`), pas
 |---|---|
 | **Executive Summary** | CA du dernier jour avec variation par rapport à la veille, commandes, panier moyen, commission Maelys · CA des 30 derniers jours · Top 5 vendeurs du dernier jour |
 | **Top Sellers** | Top 10 vendeurs du mois · CA des 3 meilleurs vendeurs sur 30 jours · Vendeurs sans vente depuis plus de 7 jours (ou jamais) |
+| **Commissions** (bonus, Finance) | Commission et CA du mois · CA annulé ou remboursé (non commissionné) · Commissions par jour · Récapitulatif journalier du mois · Commissions à facturer par vendeur |
+| **Catégories** (bonus, Catalogue) | Répartition du CA sur 30 jours · CA hebdomadaire empilé par catégorie (la semaine en cours est partielle) · Commandes, CA, panier moyen et part du CA par catégorie |
+| **Anomalies** (bonus) | Anomalies par jour et par type · Chutes de CA (global et vendeurs) · Prix suspects |
 
 ![Executive Summary](docs/metabase/executive-summary.jpg)
 ![Top Sellers](docs/metabase/top-sellers.jpg)
+![Commissions](docs/metabase/commissions.jpg)
+![Catégories](docs/metabase/categories.jpg)
+![Anomalies](docs/metabase/anomalies.jpg)
 
 ## Tests
 
@@ -167,11 +224,12 @@ Les KPIs sont calculés par rapport au **dernier jour chargé** (`max(dt)`), pas
 docker compose exec airflow-worker pytest tests/ -v
 ```
 
-23 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
+40 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
 
 | Fichier | Tests |
 |---|---|
-| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; planification par Asset, idempotence des SQL analytics, lecture de la date dans l'`extra` des événements et réconciliation des agrégats avec `fact_orders` |
+| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion et branchement qualité ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; DAGs analytics et anomalies (planification par Asset, SQL idempotents, lecture de la date dans l'`extra`, branchement de notification) ; réconciliation des agrégats avec `fact_orders` |
+| [tests/test_data_quality_operator.py](tests/test_data_quality_operator.py) | 11 tests du `DataQualityOperator`, base de données mockée : règles OK et KO, SQL généré, `fail_on_error`, configurations invalides rejetées |
 | [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) | 12 tests du Hook |
 
 ## Lancement

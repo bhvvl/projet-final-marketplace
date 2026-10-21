@@ -242,6 +242,46 @@ GROUP BY category
 ORDER BY "CA" DESC""",
         "viz": {"column_settings": {'["name","Part du CA"]': {"number_style": "percent", "decimals": 1}}},
     },
+    # -------------------------------------------------------------------- Anomalies
+    "Anomalies détectées par jour (30 jours)": {
+        "display": "bar",
+        "sql": f"""
+SELECT dt AS "Jour",
+       CASE scope WHEN 'global' THEN 'Chute du CA global'
+                  WHEN 'seller' THEN 'Chute de CA vendeur'
+                  ELSE 'Prix suspect' END AS "Type",
+       count(*) AS "Anomalies"
+FROM analytics.anomalies
+WHERE dt > {REF_DAY} - 30
+GROUP BY 1, 2
+ORDER BY 1""",
+        "viz": {"graph.dimensions": ["Jour", "Type"], "graph.metrics": ["Anomalies"], "stackable.stack_type": "stacked"},
+    },
+    "Chutes de CA (< 70 % de la moyenne 7 jours)": {
+        "display": "table",
+        "sql": """
+SELECT a.dt AS "Jour",
+       CASE a.scope WHEN 'global' THEN 'Marketplace' ELSE s.name END AS "Périmètre",
+       a.value AS "CA du jour", a.reference AS "Moyenne 7 jours", a.ratio AS "Ratio"
+FROM analytics.anomalies a
+LEFT JOIN dwh.dim_seller s ON s.seller_id = a.entity_id
+WHERE a.scope IN ('global', 'seller')
+ORDER BY a.dt DESC, a.scope, a.ratio""",
+        "viz": {"column_settings": {'["name","Ratio"]': {"number_style": "percent", "decimals": 0}}},
+    },
+    "Prix suspects (hors 0,2× – 3× le prix catalogue)": {
+        "display": "table",
+        "sql": """
+SELECT a.dt AS "Jour", a.entity_id AS "Commande", p.name AS "Produit", s.name AS "Vendeur",
+       a.value AS "Prix payé", a.reference AS "Prix catalogue", a.ratio AS "Ratio"
+FROM analytics.anomalies a
+JOIN dwh.fact_orders f ON f.order_id = a.entity_id
+JOIN dwh.dim_product p ON p.product_id = f.product_id
+JOIN dwh.dim_seller s ON s.seller_id = f.seller_id
+WHERE a.scope = 'price'
+ORDER BY a.dt DESC, a.ratio DESC""",
+        "viz": {},
+    },
 }
 
 # Grille Metabase : 24 colonnes.
@@ -282,6 +322,14 @@ DASHBOARDS = {
             ("Répartition du CA par catégorie (30 jours)", 0, 0, 10, 9),
             ("CA hebdomadaire par catégorie", 0, 10, 14, 9),
             ("Indicateurs par catégorie (30 jours)", 9, 0, 24, 7),
+        ],
+    },
+    "Anomalies": {
+        "description": "Sorties du DAG marketplace_anomaly_detect_daily : chutes de CA (global, vendeurs) et prix suspects.",
+        "cards": [
+            ("Anomalies détectées par jour (30 jours)", 0, 0, 24, 6),
+            ("Chutes de CA (< 70 % de la moyenne 7 jours)", 6, 0, 12, 9),
+            ("Prix suspects (hors 0,2× – 3× le prix catalogue)", 6, 12, 12, 9),
         ],
     },
 }

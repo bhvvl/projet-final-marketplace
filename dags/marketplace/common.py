@@ -64,6 +64,28 @@ def send_alert(kind: str, message: str, details: Any = None) -> None:
     )
 
 
+def dates_to_process(context) -> list[str]:
+    """Dates à recalculer par un DAG déclenché par l'Asset fact_orders.
+
+    Un run déclenché par Asset n'a pas de logical_date (Airflow 3) : les dates sont lues dans
+    l'extra {"dt": ...} des événements (plusieurs événements possibles, ex. backfill).
+    Run manuel, ou événement sans dt : toutes les dates présentes dans dwh.fact_orders.
+    """
+    events = [e for asset_events in (context.get("triggering_asset_events") or {}).values() for e in asset_events]
+    dates = {(event.extra or {}).get("dt") for event in events}
+    if events and None not in dates:
+        print(f"{len(events)} événement(s) d'Asset : {sorted(dates)}")
+        return sorted(dates)
+
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    rows = PostgresHook(postgres_conn_id=DWH_CONN_ID).get_records(
+        "SELECT DISTINCT dt::text FROM dwh.fact_orders ORDER BY 1"
+    )
+    print(f"Pas de date dans les événements d'Asset : recalcul complet ({len(rows)} dates)")
+    return [row[0] for row in rows]
+
+
 def read_sql(name: str) -> str:
     return (SQL_DIR / name).read_text()
 
