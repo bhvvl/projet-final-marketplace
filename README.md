@@ -86,7 +86,8 @@ flowchart LR
     er["extract_referentials_to_raw<br/>API → MinIO raw/sellers|products|customers/dt="] --> ld["load_dims<br/>staging + UPSERT dims"]
     lo --> tf["transform_fact_orders<br/>DELETE + INSERT dt = ds"]
     ld --> tf
-    tf -. "Asset fact_orders" .-> aval["DAGs aval (analytics)"]
+    tf --> pub["publish_fact_orders<br/>Asset fact_orders, extra {dt}"]
+    pub -. "déclenche" .-> aval["marketplace_analytics_aggregate_daily"]
 ```
 
 - **Planification** : `CronDataIntervalTimetable("@daily")`. En Airflow 3, `schedule="@daily"` seul donne `ds` = jour du run (journée incomplète). Avec un data interval, le run de J traite la journée complète J-1.
@@ -109,15 +110,68 @@ Trois `airflow dags test marketplace_orders_ingest_daily 2026-04-07` successifs,
 | 2 | 1 011 | 1 011 | 3 001 | 143 426,40 | `04b5d5f2ac91f435294c9c376ed2a97c` |
 | 3 | 1 011 | 1 011 | 3 001 | 143 426,40 | `04b5d5f2ac91f435294c9c376ed2a97c` |
 
+> ⚠️ **`airflow dags test` exige le DAG en pause.** Sur un DAG actif, le scheduler prend aussi en charge le run créé par `dags test` et les deux se disputent les tâches (erreur `ServerResponseError` au démarrage des tâches). Pour rejouer une date sur un DAG actif, utiliser plutôt `airflow dags trigger marketplace_orders_ingest_daily --logical-date 2026-04-07T00:00:00+00:00`.
+
+## DAG `marketplace_analytics_aggregate_daily`
+
+[dags/marketplace_analytics_aggregate_daily.py](dags/marketplace_analytics_aggregate_daily.py) : `resolve_dates`, puis `build_daily_summary`, `build_seller_daily` et `build_category_daily` en parallèle.
+
+- **Déclenché par l'Asset** `fact_orders` (`schedule=[FACT_ORDERS_ASSET]`) : chaque ingestion réussie relance les agrégats.
+- **Quelle date recalculer ?** En Airflow 3, un run déclenché par Asset n'a pas de `logical_date`, et les événements reçus ne donnent pas la date du run source. Le DAG d'ingestion publie donc la date traitée dans l'`extra` de l'événement (`{"dt": "2026-10-19"}`), et `resolve_dates` la lit. Plusieurs événements regroupés (backfill) donnent plusieurs dates.
+- **Run manuel**, ou événement sans date : recalcul complet de toutes les dates de `fact_orders`.
+- `DELETE` + `INSERT` par date dans une transaction ([dags/sql/analytics_*.sql](dags/sql/)) : idempotent.
+- **Réconciliation** : le CA de `fact_orders` (commandes `completed`) est égal au centime près à celui de `daily_summary`, `seller_daily` et `category_daily`, ce que vérifie un test.
+
+## Backfill (rejouer des dates passées)
+
+Backfill Airflow 3, exécuté par le scheduler (le DAG doit être actif) :
+
+```bash
+docker compose exec airflow-worker airflow backfill create --dag-id marketplace_orders_ingest_daily \
+  --from-date 2026-09-21 --to-date 2026-10-20 --dry-run   # puis sans --dry-run
+```
+
+Exécuté sur 30 jours (du 21/09 au 20/10/2026) : 30 runs en succès, 33 267 commandes dans `fact_orders` (avec le 07/04), 4,35 M€ de CA. Chaque run émet un événement d'Asset, ce qui relance les agrégats.
+
+## Metabase
+
+http://localhost:3000. Identifiants admin : `MB_ADMIN_EMAIL` / `MB_ADMIN_PASSWORD` du `.env`.
+
+La configuration est entièrement scriptée et ré-exécutable ([metabase/setup_dashboards.py](metabase/setup_dashboards.py), bibliothèque standard uniquement) :
+
+```bash
+python3 metabase/setup_dashboards.py
+```
+
+Le script :
+- crée le compte admin au premier lancement ;
+- déclare la source `postgres-dwh:5432` (nom Docker et port interne) ;
+- applique les formats français ;
+- crée ou met à jour, par leur nom, 9 questions SQL et 2 dashboards dans la collection « Maelys Marketplace ».
+
+À relancer après un `docker compose down -v`, qui efface la base H2 de Metabase.
+
+Les KPIs sont calculés par rapport au **dernier jour chargé** (`max(dt)`), pas à la date système : les dashboards restent pleins quelle que soit la date de démonstration.
+
+| Dashboard | Contenu |
+|---|---|
+| **Executive Summary** | CA du dernier jour avec variation par rapport à la veille, commandes, panier moyen, commission Maelys · CA des 30 derniers jours · Top 5 vendeurs du dernier jour |
+| **Top Sellers** | Top 10 vendeurs du mois · CA des 3 meilleurs vendeurs sur 30 jours · Vendeurs sans vente depuis plus de 7 jours (ou jamais) |
+
+![Executive Summary](docs/metabase/executive-summary.jpg)
+![Top Sellers](docs/metabase/top-sellers.jpg)
+
 ## Tests
 
 ```bash
 docker compose exec airflow-worker pytest tests/ -v
 ```
 
+23 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
+
 | Fichier | Tests |
 |---|---|
-| [tests/test_dags.py](tests/test_dags.py) | `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction), structure du DAG, et `test_transform_is_idempotent_on_dwh` qui joue 2 fois la transformation sur le DWH et compare les empreintes (ignoré si le DWH est vide) |
+| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; planification par Asset, idempotence des SQL analytics, lecture de la date dans l'`extra` des événements et réconciliation des agrégats avec `fact_orders` |
 | [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) | 12 tests du Hook |
 
 ## Lancement
@@ -133,6 +187,7 @@ docker compose ps      # attendre ~1-2 min que tout soit healthy
 | Airflow | http://localhost:8080 | `airflow` / `airflow` |
 | MinIO console | http://localhost:9001 | `minio_admin` / `minio_password_2026` |
 | API Marketplace | http://localhost:5000 | Bearer `formation-token-2026` |
+| Metabase | http://localhost:3000 | `admin@maelys.local` / `Admin2026!` (après `python3 metabase/setup_dashboards.py`) |
 | PostgreSQL DWH | `localhost:5433` (hôte) · `postgres-dwh:5432` (conteneurs) | `dwh_user` / `dwh_password_2026`, base `dwh` |
 
 Connections Airflow (déclarées par variables d'environnement `AIRFLOW_CONN_*` dans `docker-compose.yaml`, donc absentes de la liste de l'UI) :

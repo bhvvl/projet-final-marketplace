@@ -56,6 +56,7 @@ def test_marketplace_ingest_structure(ingest_dag):
         "load_orders_staging": {"extract_orders_to_raw"},
         "load_dims": {"extract_referentials_to_raw"},
         "transform_fact_orders": {"load_orders_staging", "load_dims"},
+        "publish_fact_orders": {"transform_fact_orders"},
     }
     assert set(ingest_dag.task_ids) == set(expected_upstream)
     for task_id, upstream in expected_upstream.items():
@@ -63,7 +64,7 @@ def test_marketplace_ingest_structure(ingest_dag):
 
     assert ingest_dag.max_active_runs == 1
     assert all(task.retries >= 1 for task in ingest_dag.tasks)
-    outlets = ingest_dag.get_task("transform_fact_orders").outlets
+    outlets = ingest_dag.get_task("publish_fact_orders").outlets
     assert [asset.uri for asset in outlets] == ["postgres://postgres-dwh:5432/dwh/dwh/fact_orders"]
 
 
@@ -95,3 +96,70 @@ def test_transform_is_idempotent_on_dwh(ingest_dag):
     staged = hook.get_first("SELECT count(*) FROM staging.orders WHERE dt = %s", parameters=(ds,))[0]
     assert results[0] == results[1]
     assert results[0][0] == staged
+
+
+# --------------------------------------------------------------------- analytics
+
+ANALYTICS_DAG_ID = "marketplace_analytics_aggregate_daily"
+ANALYTICS_TABLES = {
+    "analytics_daily_summary.sql": "analytics.daily_summary",
+    "analytics_seller_daily.sql": "analytics.seller_daily",
+    "analytics_category_daily.sql": "analytics.category_daily",
+}
+
+
+@pytest.fixture(scope="module")
+def analytics_dag(dagbag):
+    dag = dagbag.get_dag(ANALYTICS_DAG_ID)
+    assert dag is not None, f"DAG {ANALYTICS_DAG_ID} introuvable"
+    return dag
+
+
+def test_analytics_is_triggered_by_fact_orders_asset(analytics_dag):
+    from airflow.timetables.simple import AssetTriggeredTimetable
+
+    assert isinstance(analytics_dag.timetable, AssetTriggeredTimetable)
+    uris = [asset.uri for _, asset in analytics_dag.timetable.asset_condition.iter_assets()]
+    assert uris == ["postgres://postgres-dwh:5432/dwh/dwh/fact_orders"]
+    assert set(analytics_dag.task_ids) == {
+        "resolve_dates", "build_daily_summary", "build_seller_daily", "build_category_daily"
+    }
+
+
+@pytest.mark.parametrize("sql_file, table", ANALYTICS_TABLES.items())
+def test_analytics_sql_is_idempotent(sql_file, table):
+    sql = re.sub(r"--[^\n]*", "", (Path(__file__).resolve().parents[1] / "dags" / "sql" / sql_file).read_text())
+
+    delete = re.search(rf"DELETE\s+FROM\s+{re.escape(table)}\s+WHERE\s+dt\s*=\s*%\(dt\)s", sql)
+    insert = re.search(rf"INSERT\s+INTO\s+{re.escape(table)}", sql)
+    assert delete and insert and delete.start() < insert.start()
+
+
+def test_resolve_dates_reads_dt_from_asset_events(analytics_dag):
+    from types import SimpleNamespace
+
+    resolve = analytics_dag.get_task("resolve_dates").python_callable
+    asset = analytics_dag.timetable.asset_condition
+    events = {asset: [SimpleNamespace(extra={"dt": "2026-10-19"}), SimpleNamespace(extra={"dt": "2026-10-18"})]}
+
+    assert resolve(triggering_asset_events=events) == ["2026-10-18", "2026-10-19"]
+
+
+def test_analytics_reconciles_with_fact_orders():
+    """Le CA est identique dans fact_orders et dans les 3 tables analytics (DWH du compose)."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    hook = PostgresHook(postgres_conn_id="postgres_dwh")
+    try:
+        fact = hook.get_first("SELECT sum(total_amount) FROM dwh.fact_orders WHERE status = 'completed'")[0]
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"DWH injoignable : {exc}")
+    if fact is None:
+        pytest.skip("dwh.fact_orders vide")
+
+    aggregates = hook.get_first(
+        "SELECT (SELECT sum(total_revenue) FROM analytics.daily_summary),"
+        "       (SELECT sum(revenue) FROM analytics.seller_daily),"
+        "       (SELECT sum(revenue) FROM analytics.category_daily)"
+    )
+    assert list(aggregates) == [fact, fact, fact]

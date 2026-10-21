@@ -1,8 +1,8 @@
 """Pipeline ELT principal : API Marketplace -> MinIO (raw) -> staging -> dwh.fact_orders.
 
-    extract_orders_to_raw ──► load_orders_staging ──────┐
-                                                        ├──► transform_fact_orders  (outlet : Asset fact_orders)
-    extract_referentials_to_raw ──► load_dimensions ────┘
+    extract_orders_to_raw ──► load_orders_staging ──┐
+                                                    ├──► transform_fact_orders ──► publish_fact_orders
+    extract_referentials_to_raw ──► load_dims ──────┘                              (Asset fact_orders, extra {"dt": ds})
 
 Chaque tâche est rejouable pour une même date {{ ds }} :
   - raw : la partition dt= est écrasée ;
@@ -80,12 +80,19 @@ def marketplace_orders_ingest_daily():
         conn_id=DWH_CONN_ID,
         sql="sql/transform_fact_orders.sql",
         autocommit=False,  # DELETE + INSERT validés ensemble, en un seul COMMIT
-        outlets=[FACT_ORDERS_ASSET],
     )
+
+    @task(outlets=[FACT_ORDERS_ASSET])
+    def publish_fact_orders(**context) -> None:
+        """Émet l'événement d'Asset en y joignant la date chargée.
+
+        Les DAGs aval n'ont pas de logical_date (Airflow 3) : c'est l'extra qui leur dit quoi recalculer.
+        """
+        context["outlet_events"][FACT_ORDERS_ASSET].extra = {"dt": context["ds"]}
 
     staged = load_orders_staging(extract_orders_to_raw())
     dims = load_dims(extract_referentials_to_raw())
-    [staged, dims] >> transform_fact_orders
+    [staged, dims] >> transform_fact_orders >> publish_fact_orders()
 
 
 marketplace_orders_ingest_daily()
