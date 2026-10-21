@@ -12,6 +12,7 @@ en chute de ventes et des vendeurs qui arrêtent de vendre.
 import hashlib
 import os
 import random
+from collections import deque
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 
@@ -175,6 +176,23 @@ def check_auth_and_chaos():
     if FAILURE_RATE and random.random() < FAILURE_RATE:
         return jsonify(error="service_unavailable", message="Simulated failure"), 503
     return None
+
+
+ALERTS = deque(maxlen=200)
+
+
+@app.post("/webhook")
+def webhook():
+    """Récepteur d'alertes simulé (remplaçable par Slack/Teams en changeant la Connection Airflow)."""
+    alert = {"received_at": datetime.now().isoformat(timespec="seconds"), "payload": request.get_json(silent=True)}
+    ALERTS.append(alert)
+    app.logger.warning("ALERTE reçue : %s", alert["payload"])
+    return jsonify(status="accepted"), 202
+
+
+@app.get("/webhook/alerts")
+def webhook_alerts():
+    return jsonify(list(ALERTS))
 
 
 @app.get("/health")

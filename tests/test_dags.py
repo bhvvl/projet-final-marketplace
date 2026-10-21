@@ -55,7 +55,10 @@ def test_marketplace_ingest_structure(ingest_dag):
         "extract_referentials_to_raw": set(),
         "load_orders_staging": {"extract_orders_to_raw"},
         "load_dims": {"extract_referentials_to_raw"},
-        "transform_fact_orders": {"load_orders_staging", "load_dims"},
+        "dq_staging_orders": {"load_orders_staging"},
+        "check_quality": {"dq_staging_orders"},
+        "alert_dq_failed": {"check_quality", "dq_staging_orders"},
+        "transform_fact_orders": {"check_quality", "load_dims"},
         "publish_fact_orders": {"transform_fact_orders"},
     }
     assert set(ingest_dag.task_ids) == set(expected_upstream)
@@ -63,7 +66,7 @@ def test_marketplace_ingest_structure(ingest_dag):
         assert ingest_dag.get_task(task_id).upstream_task_ids == upstream, task_id
 
     assert ingest_dag.max_active_runs == 1
-    assert all(task.retries >= 1 for task in ingest_dag.tasks)
+    assert all(task.retries >= 1 for task in ingest_dag.tasks if task.task_id != "alert_dq_failed")
     outlets = ingest_dag.get_task("publish_fact_orders").outlets
     assert [asset.uri for asset in outlets] == ["postgres://postgres-dwh:5432/dwh/dwh/fact_orders"]
 
@@ -163,3 +166,10 @@ def test_analytics_reconciles_with_fact_orders():
         "       (SELECT sum(revenue) FROM analytics.category_daily)"
     )
     assert list(aggregates) == [fact, fact, fact]
+
+
+@pytest.mark.parametrize("passed, expected", [(True, "transform_fact_orders"), (False, "alert_dq_failed")])
+def test_quality_branch_routes_to_dwh_or_alert(ingest_dag, passed, expected):
+    branch = ingest_dag.get_task("check_quality").python_callable
+
+    assert branch({"passed": passed, "checks": []}) == expected

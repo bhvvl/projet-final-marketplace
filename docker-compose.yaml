@@ -23,6 +23,8 @@ x-airflow-common: &airflow-common
     AIRFLOW_CONN_MARKETPLACE_API: '{"conn_type": "http", "host": "http://api-marketplace:5000", "password": "${MARKETPLACE_API_TOKEN}"}'
     AIRFLOW_CONN_POSTGRES_DWH: '{"conn_type": "postgres", "host": "postgres-dwh", "port": 5432, "login": "${DWH_USER}", "password": "${DWH_PASSWORD}", "schema": "${DWH_DB}"}'
     AIRFLOW_CONN_MINIO_S3: '{"conn_type": "aws", "login": "${MINIO_ROOT_USER}", "password": "${MINIO_ROOT_PASSWORD}", "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}'
+    # Webhook d'alerte (simulé par l'API ; pointer vers Slack/Teams en production)
+    AIRFLOW_CONN_ALERT_WEBHOOK: '{"conn_type": "http", "host": "http://api-marketplace:5000", "password": "${MARKETPLACE_API_TOKEN}"}'
     MINIO_BUCKET: ${MINIO_BUCKET}
   volumes:
     - ./dags:/opt/airflow/dags

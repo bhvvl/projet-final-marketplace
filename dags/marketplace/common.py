@@ -12,6 +12,7 @@ from airflow.sdk import Asset
 API_CONN_ID = "marketplace_api"
 DWH_CONN_ID = "postgres_dwh"
 S3_CONN_ID = "minio_s3"
+ALERT_CONN_ID = "alert_webhook"
 BUCKET = os.environ.get("MINIO_BUCKET", "data-lake")
 
 SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
@@ -49,6 +50,18 @@ def read_raw(entity: str, ds: str) -> list[dict[str, Any]]:
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
     return json.loads(S3Hook(aws_conn_id=S3_CONN_ID).read_key(raw_key(entity, ds), bucket_name=BUCKET))
+
+
+def send_alert(kind: str, message: str, details: Any = None) -> None:
+    """POST JSON sur le webhook d'alerte (Connection alert_webhook : host = URL, password = token Bearer)."""
+    from airflow.providers.http.hooks.http import HttpHook
+    from airflow.sdk import BaseHook
+
+    token = BaseHook.get_connection(ALERT_CONN_ID).password
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    HttpHook(method="POST", http_conn_id=ALERT_CONN_ID).run(
+        "/webhook", json={"kind": kind, "message": message, "details": details}, headers=headers
+    )
 
 
 def read_sql(name: str) -> str:

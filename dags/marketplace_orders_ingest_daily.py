@@ -1,8 +1,13 @@
 """Pipeline ELT principal : API Marketplace -> MinIO (raw) -> staging -> dwh.fact_orders.
 
-    extract_orders_to_raw ──► load_orders_staging ──┐
-                                                    ├──► transform_fact_orders ──► publish_fact_orders
-    extract_referentials_to_raw ──► load_dims ──────┘                              (Asset fact_orders, extra {"dt": ds})
+    extract_orders_to_raw ──► load_orders_staging ──► dq_staging_orders ──► check_quality ──┬──► alert_dq_failed
+                                                                                           │
+    extract_referentials_to_raw ──► load_dims ─────────────────────────────────────────────┴──► transform_fact_orders
+                                                                                                    │
+                                                    (Asset fact_orders, extra {"dt": ds}) ◄── publish_fact_orders
+
+Contrôle qualité de staging.orders sur la partition {{ ds }} : si une règle est violée,
+le DWH n'est pas touché, une alerte part sur le webhook et le run échoue.
 
 Chaque tâche est rejouable pour une même date {{ ds }} :
   - raw : la partition dt= est écrasée ;
@@ -26,8 +31,18 @@ from marketplace.common import (
     FACT_ORDERS_ASSET,
     load_dimensions,
     load_orders_to_staging,
+    send_alert,
     upload_raw,
 )
+from operators.data_quality_operator import DataQualityOperator
+
+STAGING_ORDERS_CHECKS = [
+    {"rule": "not_empty"},
+    # customer_id peut être nul (rattaché au membre UNKNOWN) : il n'est pas contrôlé ici.
+    {"rule": "not_null", "columns": ["order_id", "order_ts", "seller_id", "product_id",
+                                     "quantity", "total_amount", "status"]},
+    {"rule": "no_future_date", "column": "order_ts"},
+]
 
 
 @dag(
@@ -75,6 +90,27 @@ def marketplace_orders_ingest_daily():
     def load_dims(_extracted: dict, **context) -> dict:
         return load_dimensions(context["ds"])
 
+    dq_staging_orders = DataQualityOperator(
+        task_id="dq_staging_orders",
+        conn_id=DWH_CONN_ID,
+        table="staging.orders",
+        where="dt = '{{ ds }}'",
+        checks=STAGING_ORDERS_CHECKS,
+    )
+
+    @task.branch
+    def check_quality(report: dict) -> str:
+        return "transform_fact_orders" if report["passed"] else "alert_dq_failed"
+
+    @task(retries=0)
+    def alert_dq_failed(report: dict, **context) -> None:
+        from airflow.exceptions import AirflowFailException  # échec sans retry
+
+        failed = [check for check in report["checks"] if not check["passed"]]
+        message = f"Qualité KO sur staging.orders pour {context['ds']} : DWH non chargé"
+        send_alert("data_quality", message, {"dt": context["ds"], "failed_checks": failed})
+        raise AirflowFailException(f"{message} — {failed}")
+
     transform_fact_orders = SQLExecuteQueryOperator(
         task_id="transform_fact_orders",
         conn_id=DWH_CONN_ID,
@@ -92,7 +128,10 @@ def marketplace_orders_ingest_daily():
 
     staged = load_orders_staging(extract_orders_to_raw())
     dims = load_dims(extract_referentials_to_raw())
-    [staged, dims] >> transform_fact_orders >> publish_fact_orders()
+    staged >> dq_staging_orders
+    branch = check_quality(dq_staging_orders.output)
+    branch >> alert_dq_failed(dq_staging_orders.output)
+    [branch, dims] >> transform_fact_orders >> publish_fact_orders()
 
 
 marketplace_orders_ingest_daily()
