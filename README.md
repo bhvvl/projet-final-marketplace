@@ -145,6 +145,28 @@ curl -H "Authorization: Bearer formation-token-2026" http://localhost:5000/webho
 
 Passer à Slack ou Teams ne demande que de changer la Connection.
 
+## Alerte en cas d'échec de DAG (US-07)
+
+Les 3 DAGs déclarent `on_failure_callback=notify_dag_failure` ([dags/marketplace/common.py](dags/marketplace/common.py)) : chaque run en échec envoie une alerte `dag_failure` au même webhook.
+
+```json
+{"kind": "dag_failure",
+ "message": "Échec du DAG marketplace_orders_ingest_daily (run manual__2026-10-21T13:20:05…)",
+ "details": {"dag_id": "marketplace_orders_ingest_daily", "run_id": "manual__…",
+             "logical_date": "2026-08-29T00:00:00+00:00", "reason": "task_failure",
+             "url": "http://localhost:8080/dags/marketplace_orders_ingest_daily/runs/manual__…"}}
+```
+
+- **Où il s'exécute** : en Airflow 3, le callback d'un DAG tourne dans le dag-processor, hors des tâches. Il ne lève donc jamais d'exception : une panne du webhook est seulement journalisée, sinon l'alerte serait perdue sans bruit.
+- **Pas de nom de tâche** : le contexte transmis par Airflow 3.1 est celui de la *dernière* tâche du run, pas forcément celle qui a échoué. L'alerte donne à la place le lien vers le run dans l'UI.
+- **Vérifié en conditions réelles** :
+  - l'API est mise en panne avec `API_FAILURE_RATE=1 docker compose up -d api-marketplace` ;
+  - un run pour le 29/08 est déclenché ;
+  - l'extraction échoue après ses 3 tentatives (retry du Hook sur 503, puis `retries=2` d'Airflow) ;
+  - l'alerte arrive à la seconde où le run échoue.
+- **Doublon côté qualité** : un contrôle qualité KO produit deux alertes, `data_quality` (le détail des règles) puis `dag_failure` (l'échec du run).
+- Les pannes simulées de l'API (`API_FAILURE_RATE`) épargnent `/webhook`, qui représente un service d'alerte distinct.
+
 ## DAG `marketplace_analytics_aggregate_daily`
 
 [dags/marketplace_analytics_aggregate_daily.py](dags/marketplace_analytics_aggregate_daily.py) : `resolve_dates`, puis `build_daily_summary`, `build_seller_daily` et `build_category_daily` en parallèle, puis `mark_refreshed`.
@@ -282,11 +304,11 @@ Tout est versionné et chargé au démarrage, sans import manuel à refaire :
 docker compose exec airflow-worker pytest tests/ -v
 ```
 
-41 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
+44 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
 
 | Fichier | Tests |
 |---|---|
-| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion et branchement qualité ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; DAGs analytics et anomalies (planification par Asset, SQL idempotents, branchement de notification) ; choix des dates à recalculer, avec la base mockée puis sur le DWH (une date rechargée après son dernier calcul est détectée) ; réconciliation des agrégats avec `fact_orders` |
+| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion et branchement qualité ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; DAGs analytics et anomalies (planification par Asset, SQL idempotents, branchement de notification) ; choix des dates à recalculer, avec la base mockée puis sur le DWH (une date rechargée après son dernier calcul est détectée) ; alerte d'échec (callback présent sur les 3 DAGs, contenu de l'alerte, aucune exception si le webhook est en panne) ; réconciliation des agrégats avec `fact_orders` |
 | [tests/test_data_quality_operator.py](tests/test_data_quality_operator.py) | 11 tests du `DataQualityOperator`, base de données mockée : règles OK et KO, SQL généré, `fail_on_error`, configurations invalides rejetées |
 | [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) | 12 tests du Hook |
 
@@ -334,7 +356,7 @@ Connections Airflow (déclarées par variables d'environnement `AIRFLOW_CONN_*` 
 - Une commande = un produit. `status` ∈ `completed` / `cancelled` / `refunded`.
 - Défauts volontaires : ~0,2 % de `customer_id` nuls, ~0,4 % de prix suspects (×10, ×25 ou 0,01 €), ~7 % de journées en chute de ventes, ~6 % de vendeurs qui arrêtent de vendre.
 - Date future → liste vide · date absente ou invalide → 400 · sans token → 401.
-- `API_FAILURE_RATE` > 0 renvoie des 503 aléatoires pour tester le retry du Hook.
+- `API_FAILURE_RATE` > 0 renvoie des 503 aléatoires pour tester le retry du Hook (sauf sur `/webhook`). Exemple : `API_FAILURE_RATE=1 docker compose up -d api-marketplace` pour une panne totale, puis `docker compose up -d api-marketplace` pour revenir à la normale.
 
 ```bash
 curl http://localhost:5000/health

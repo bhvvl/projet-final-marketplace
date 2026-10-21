@@ -15,6 +15,7 @@ DWH_CONN_ID = "postgres_dwh"
 S3_CONN_ID = "minio_s3"
 ALERT_CONN_ID = "alert_webhook"
 BUCKET = os.environ.get("MINIO_BUCKET", "data-lake")
+AIRFLOW_UI_URL = os.environ.get("AIRFLOW_UI_URL", "http://localhost:8080")
 
 SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 
@@ -63,6 +64,36 @@ def send_alert(kind: str, message: str, details: Any = None) -> None:
     HttpHook(method="POST", http_conn_id=ALERT_CONN_ID).run(
         "/webhook", json={"kind": kind, "message": message, "details": details}, headers=headers
     )
+
+
+def notify_dag_failure(context) -> None:
+    """on_failure_callback de DAG (US-07) : alerte sur le webhook quand un run échoue.
+
+    Exécuté hors des tâches (par le dag-processor en Airflow 3) : il ne doit jamais lever
+    d'exception, sinon l'alerte serait perdue sans bruit. Toute erreur est seulement journalisée.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        dag_run = context.get("dag_run")
+        dag = context.get("dag")
+        dag_id = getattr(dag_run, "dag_id", None) or getattr(dag, "dag_id", None)
+        run_id = getattr(dag_run, "run_id", None) or context.get("run_id")
+        logical_date = getattr(dag_run, "logical_date", None)
+        # Pas de nom de tâche : le contexte fourni par Airflow 3.1 est celui de la dernière tâche
+        # du run, pas forcément celle qui a échoué. Le lien vers le run donne le détail.
+        details = {
+            "dag_id": dag_id,
+            "run_id": run_id,
+            "logical_date": logical_date.isoformat() if logical_date else None,
+            "reason": context.get("reason"),
+            "url": f"{AIRFLOW_UI_URL}/dags/{dag_id}/runs/{run_id}",
+        }
+        send_alert("dag_failure", f"Échec du DAG {dag_id} (run {run_id})", details)
+        log.info("Alerte d'échec envoyée : %s", details)
+    except Exception:  # noqa: BLE001
+        log.exception("Impossible d'envoyer l'alerte d'échec du DAG")
 
 
 STALE_DATES_SQL = """

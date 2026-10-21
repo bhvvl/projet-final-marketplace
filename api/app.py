@@ -173,7 +173,8 @@ def check_auth_and_chaos():
         return None
     if request.headers.get("Authorization") != f"Bearer {API_TOKEN}":
         return jsonify(error="unauthorized", message="Missing or invalid Bearer token"), 401
-    if FAILURE_RATE and random.random() < FAILURE_RATE:
+    # Pannes simulées sur le backoffice uniquement : /webhook représente un service d'alerte distinct.
+    if FAILURE_RATE and not request.path.startswith("/webhook") and random.random() < FAILURE_RATE:
         return jsonify(error="service_unavailable", message="Simulated failure"), 503
     return None
 

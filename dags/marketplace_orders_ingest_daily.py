@@ -31,6 +31,7 @@ from marketplace.common import (
     FACT_ORDERS_ASSET,
     load_dimensions,
     load_orders_to_staging,
+    notify_dag_failure,
     send_alert,
     upload_raw,
 )
@@ -56,6 +57,7 @@ STAGING_ORDERS_CHECKS = [
     max_active_runs=1,
     default_args={"owner": "data-team", "retries": 2, "retry_delay": timedelta(minutes=2)},
     dagrun_timeout=timedelta(hours=1),
+    on_failure_callback=notify_dag_failure,  # US-07 : alerte webhook si le run échoue
     params={"commission_rate": 0.12},
     tags=["marketplace", "elt", "ingest"],
 )

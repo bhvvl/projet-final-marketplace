@@ -17,7 +17,14 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
-from marketplace.common import DWH_CONN_ID, FACT_ORDERS_ASSET, dates_to_process, mark_refreshed, read_sql
+from marketplace.common import (
+    DWH_CONN_ID,
+    FACT_ORDERS_ASSET,
+    dates_to_process,
+    mark_refreshed,
+    notify_dag_failure,
+    read_sql,
+)
 
 DAG_ID = "marketplace_analytics_aggregate_daily"
 AGGREGATES = {
@@ -36,6 +43,7 @@ AGGREGATES = {
     max_active_runs=1,
     # Actif dès sa création : il ne fait que réagir aux ingestions (aucune exécution sans événement).
     is_paused_upon_creation=False,
+    on_failure_callback=notify_dag_failure,  # US-07 : alerte webhook si le run échoue
     default_args={"owner": "data-team", "retries": 2, "retry_delay": timedelta(minutes=1)},
     params={"full_refresh": False},
     tags=["marketplace", "analytics"],

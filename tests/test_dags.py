@@ -243,3 +243,50 @@ def test_anomaly_sql_is_idempotent():
     delete = re.search(r"DELETE\s+FROM\s+analytics\.anomalies\s+WHERE\s+dt\s*=\s*%\(dt\)s", sql)
     inserts = [m.start() for m in re.finditer(r"INSERT\s+INTO\s+analytics\.anomalies", sql)]
     assert delete and len(inserts) == 3 and delete.start() < min(inserts)
+
+
+# ------------------------------------------------------------ alerte d'échec (US-07)
+
+
+def test_all_dags_alert_on_failure(dagbag):
+    for dag_id, dag in dagbag.dags.items():
+        callbacks = dag.on_failure_callback
+        callbacks = callbacks if isinstance(callbacks, list) else [callbacks]
+        assert any(getattr(cb, "__name__", "") == "notify_dag_failure" for cb in callbacks), dag_id
+
+
+def test_notify_dag_failure_sends_alert():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from marketplace import common
+
+    dag_run = SimpleNamespace(
+        dag_id="marketplace_orders_ingest_daily",
+        run_id="scheduled__2026-10-20",
+        logical_date=datetime(2026, 10, 20, tzinfo=timezone.utc),
+    )
+    context = {"dag_run": dag_run, "ti": SimpleNamespace(task_id="publish_fact_orders"), "reason": "task_failure"}
+    with mock.patch.object(common, "send_alert") as send_alert:
+        common.notify_dag_failure(context)
+
+    kind, message, details = send_alert.call_args.args
+    assert kind == "dag_failure"
+    assert "marketplace_orders_ingest_daily" in message
+    assert details == {
+        "dag_id": "marketplace_orders_ingest_daily",
+        "run_id": "scheduled__2026-10-20",
+        "logical_date": "2026-10-20T00:00:00+00:00",
+        "reason": "task_failure",
+        "url": "http://localhost:8080/dags/marketplace_orders_ingest_daily/runs/scheduled__2026-10-20",
+    }
+
+
+def test_notify_dag_failure_never_raises():
+    from unittest import mock
+
+    from marketplace import common
+
+    with mock.patch.object(common, "send_alert", side_effect=ConnectionError("webhook down")):
+        common.notify_dag_failure({"dag": None})  # contexte incomplet + webhook en panne : pas d'exception
