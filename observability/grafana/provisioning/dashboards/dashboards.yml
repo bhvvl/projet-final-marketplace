@@ -1,0 +1,11 @@
+apiVersion: 1
+
+# Dashboards versionnés dans observability/grafana/dashboards, chargés au démarrage de Grafana.
+providers:
+  - name: maelys
+    folder: Maelys - Supervision
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

@@ -13,6 +13,9 @@ flowchart LR
     airflow -- "raw JSON dt=" --> minio[("MinIO<br/>data-lake")]
     airflow -- "load + transform" --> pg[("PostgreSQL 18<br/>staging / dwh / analytics")]
     pg --> mb["Metabase"]
+    airflow -. "StatsD" .-> prom[("Prometheus")]
+    pg -. "postgres-exporter" .-> prom
+    prom --> graf["Grafana"]
 ```
 
 ## Modèle de données
@@ -217,6 +220,48 @@ Les KPIs sont calculés par rapport au **dernier jour chargé** (`max(dt)`), pas
 ![Commissions](docs/metabase/commissions.jpg)
 ![Catégories](docs/metabase/categories.jpg)
 ![Anomalies](docs/metabase/anomalies.jpg)
+
+## Observabilité : Prometheus + Grafana (bonus)
+
+```mermaid
+flowchart LR
+    af[["Airflow<br/>(StatsD)"]] -- "UDP 9125" --> sx["statsd-exporter<br/>:9102"]
+    pg[("postgres-dwh")] --> px["postgres-exporter<br/>:9187"]
+    sx --> prom[("Prometheus<br/>:9090")]
+    px --> prom
+    prom --> graf["Grafana<br/>:3001"]
+```
+
+| Service | URL | Rôle |
+|---|---|---|
+| Grafana | http://localhost:3001 (`admin` / `admin`, à changer hors formation) | Dashboards, chargés automatiquement au démarrage |
+| Prometheus | http://localhost:9090 | Collecte des métriques (cibles : `airflow`, `postgres-dwh`, `prometheus`) |
+| statsd-exporter | http://localhost:9102/metrics | Métriques StatsD d'Airflow converties au format Prometheus |
+| postgres-exporter | http://localhost:9187/metrics | Métriques du Data Warehouse |
+
+Les métriques Airflow sont activées dans `x-airflow-common` (`AIRFLOW__METRICS__STATSD_*`).
+
+Tout est versionné et chargé au démarrage, sans import manuel à refaire :
+- [observability/prometheus/prometheus.yml](observability/prometheus/prometheus.yml) : cibles de collecte ;
+- [observability/grafana/provisioning/](observability/grafana/provisioning/) : source de données Prometheus et dossier de dashboards ;
+- [observability/grafana/dashboards/](observability/grafana/dashboards/) : les JSON des dashboards ;
+- [observability/statsd/mapping.yml](observability/statsd/mapping.yml) : une seule règle, voir plus bas.
+
+**Dashboards importés** (dossier « Maelys - Supervision ») :
+
+| Dashboard | ID grafana.com | Adaptation |
+|---|---|---|
+| **Airflow 3** | 24832 | Source de données fixée sur Prometheus. Unité des durées passée de ms à s, car statsd-exporter convertit les timers en secondes. `airflow.triggerer_heartbeat` est renommé `airflow_triggerer_heartbeat_total` (suffixe de compteur attendu). Les 16 panneaux ont des données. |
+| **PostgreSQL Database** | 9628 | Aucune modification du JSON. Conçu pour Kubernetes, il filtre sur les labels `release` et `kubernetes_namespace` : Prometheus les ajoute de façon statique à la cible postgres-exporter. 31 panneaux sur 32 ont des données. |
+
+> ⚠️ **L'ID 11010 indiqué dans le cahier des charges n'est pas un dashboard Airflow** : sur grafana.com, c'est « Kube Carbon » (empreinte carbone Kubernetes). Le « Airflow cluster dashboard » de databand (20788) attend des métriques renommées par leur propre configuration statsd, pensée pour Airflow 2. J'ai retenu **24832 « Airflow 3 »**, conçu pour Airflow 3.1 et compatible avec un statsd-exporter standard.
+
+**Limites connues** :
+- **Checkpoint Stats vide** : depuis PostgreSQL 17, les statistiques de checkpoint ont quitté `pg_stat_bgwriter` pour `pg_stat_checkpointer`, alors que le dashboard 9628 date d'avant.
+- **Start Time** affiche N/A.
+
+![Airflow 3](docs/grafana/airflow-3.jpg)
+![PostgreSQL Database](docs/grafana/postgresql-database.jpg)
 
 ## Tests
 

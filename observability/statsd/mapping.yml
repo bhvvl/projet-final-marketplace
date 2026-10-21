@@ -1,0 +1,6 @@
+# Les métriques non listées gardent le nommage par défaut de statsd-exporter
+# (airflow.pool.open_slots.default_pool -> airflow_pool_open_slots_default_pool).
+mappings:
+  # Compteur : suffixe _total attendu par le dashboard Grafana 24832 (convention Prometheus).
+  - match: "airflow.triggerer_heartbeat"
+    name: "airflow_triggerer_heartbeat_total"

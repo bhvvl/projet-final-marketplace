@@ -19,6 +19,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+    # Métriques StatsD -> statsd-exporter -> Prometheus -> Grafana
+    AIRFLOW__METRICS__STATSD_ON: "True"
+    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: "9125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
     # Connections (lues par les Hooks — aucun secret dans le code)
     AIRFLOW_CONN_MARKETPLACE_API: '{"conn_type": "http", "host": "http://api-marketplace:5000", "password": "${MARKETPLACE_API_TOKEN}"}'
     AIRFLOW_CONN_POSTGRES_DWH: '{"conn_type": "postgres", "host": "postgres-dwh", "port": 5432, "login": "${DWH_USER}", "password": "${DWH_PASSWORD}", "schema": "${DWH_DB}"}'
@@ -176,6 +181,77 @@ services:
     networks:
       - airflow-net
 
+  # ------------------------------------------------------- Observabilité (bonus)
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.28.0
+    command:
+      - --statsd.listen-udp=:9125
+      - --statsd.listen-tcp=:9125
+      - --web.listen-address=:9102
+      - --statsd.mapping-config=/etc/statsd/mapping.yml
+    ports:
+      - "9102:9102"
+    volumes:
+      - ./observability/statsd/mapping.yml:/etc/statsd/mapping.yml:ro
+    restart: always
+    networks:
+      - airflow-net
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_URI: postgres-dwh:5432/${DWH_DB}?sslmode=disable
+      DATA_SOURCE_USER: ${DWH_USER}
+      DATA_SOURCE_PASS: ${DWH_PASSWORD}
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+    restart: always
+    networks:
+      - airflow-net
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: always
+    networks:
+      - airflow-net
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_LANGUAGE: fr-FR
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports:
+      - "3001:3000"  # 3000 est pris par Metabase
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: always
+    networks:
+      - airflow-net
+
   # ----------------------------------------------------------------- Airflow
   airflow-apiserver:
     <<: *airflow-common
@@ -286,6 +362,8 @@ volumes:
   pg-dwh-data:
   minio-data:
   metabase-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   airflow-net:
