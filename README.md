@@ -15,6 +15,67 @@ flowchart LR
     pg --> mb["Metabase"]
 ```
 
+## Modèle de données
+
+Fichier : [init-db/schema.sql](init-db/schema.sql) (ré-exécutable). Trois schémas :
+
+- `staging` : copie typée de l'API (`orders` par `dt`, référentiels `sellers` / `products` / `customers`).
+- `dwh` : étoile Kimball. Grain de `fact_orders` = 1 commande (l'API vend 1 produit par commande).
+- `analytics` : agrégats pour Metabase (`daily_summary`, `seller_daily`, `category_daily`, `anomalies`).
+
+```mermaid
+erDiagram
+    DIM_DATE ||--o{ FACT_ORDERS : "dt"
+    DIM_SELLER ||--o{ FACT_ORDERS : "seller_id"
+    DIM_PRODUCT ||--o{ FACT_ORDERS : "product_id"
+    DIM_CUSTOMER ||--o{ FACT_ORDERS : "customer_id"
+    DIM_SELLER ||--o{ DIM_PRODUCT : "seller_id"
+    DIM_DATE { date dt PK
+        smallint year
+        smallint month
+        smallint day_of_week
+        boolean is_weekend }
+    DIM_SELLER { text seller_id PK
+        text name
+        text seller_type
+        text country
+        date joined_date }
+    DIM_PRODUCT { text product_id PK
+        text name
+        text category
+        text seller_id FK
+        numeric base_price }
+    DIM_CUSTOMER { text customer_id PK
+        text email
+        text city
+        date signup_date }
+    FACT_ORDERS { text order_id PK
+        date dt FK
+        text seller_id FK
+        text product_id FK
+        text customer_id FK
+        int quantity
+        numeric total_amount
+        numeric commission_amount
+        text status }
+```
+
+Choix :
+
+- **Dimensions SCD1** (UPSERT) : l'historique des attributs n'est pas demandé (SCD2 hors périmètre).
+- **Membre `UNKNOWN`** dans chaque dimension : un `customer_id` nul ou une clé inconnue est rattaché à `UNKNOWN`, les FOREIGN KEY de `fact_orders` restent toujours valides.
+- **Commission** = 12 % de `total_amount` pour les commandes `completed`, 0 sinon. Le taux est stocké (`commission_rate`) pour tracer un éventuel changement.
+- **CA** (`revenue`) = commandes `completed` uniquement.
+- `dim_date` pré-remplie de 2020 à 2030 par `generate_series`.
+
+## MarketplaceAPIHook
+
+[plugins/hooks/marketplace_api_hook.py](plugins/hooks/marketplace_api_hook.py) : hérite de `BaseHook` et lit la Connection `marketplace_api` (`host` = URL, `password` = token Bearer).
+
+- `get_orders(day)` (`str`, `date` ou `datetime`), `get_sellers(limit)`, `get_products()`, `get_customers(limit)`, `health()`, `test_connection()`.
+- Retry avec backoff exponentiel sur timeout, connexion refusée et 429/5xx (3 retries par défaut). 400/401 échouent immédiatement.
+- Tests : [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) — serveur HTTP local scripté pour tester le retry réellement, plus un test de déterminisme contre l'API du compose.
+
 ## Lancement
 
 ```bash
