@@ -141,6 +141,107 @@ WHERE s.seller_id <> 'UNKNOWN'
 ORDER BY l.last_dt NULLS FIRST, s.name""",
         "viz": {},
     },
+    # ------------------------------------------------------------------ Commissions
+    "Commission du mois": {
+        "display": "scalar",
+        "sql": f"""
+SELECT sum(total_commission) AS "Commission"
+FROM analytics.daily_summary
+WHERE dt BETWEEN date_trunc('month', {REF_DAY})::date AND {REF_DAY}""",
+        "viz": {"column_settings": {'["name","Commission"]': {"number_style": "currency", "currency": "EUR"}}},
+    },
+    "CA commissionné du mois": {
+        "display": "scalar",
+        "sql": f"""
+SELECT sum(total_revenue) AS "CA"
+FROM analytics.daily_summary
+WHERE dt BETWEEN date_trunc('month', {REF_DAY})::date AND {REF_DAY}""",
+        "viz": {"column_settings": {'["name","CA"]': {"number_style": "currency", "currency": "EUR"}}},
+    },
+    "CA annulé ou remboursé du mois (non commissionné)": {
+        "display": "scalar",
+        "sql": f"""
+SELECT COALESCE(sum(total_amount), 0) AS "CA non commissionné"
+FROM dwh.fact_orders
+WHERE status IN ('cancelled', 'refunded')
+  AND dt BETWEEN date_trunc('month', {REF_DAY})::date AND {REF_DAY}""",
+        "viz": {"column_settings": {'["name","CA non commissionné"]': {"number_style": "currency", "currency": "EUR"}}},
+    },
+    "Commissions par jour (30 jours)": {
+        "display": "bar",
+        "sql": f"""
+SELECT dt AS "Jour", total_commission AS "Commission"
+FROM analytics.daily_summary
+WHERE dt > {REF_DAY} - 30
+ORDER BY dt""",
+        "viz": {"graph.dimensions": ["Jour"], "graph.metrics": ["Commission"], "graph.y_axis.title_text": "Commission (€)"},
+    },
+    "Récapitulatif des commissions par jour (mois)": {
+        "display": "table",
+        "sql": f"""
+SELECT dt AS "Jour",
+       completed_orders AS "Commandes facturées",
+       cancelled_orders AS "Annulées",
+       refunded_orders AS "Remboursées",
+       total_revenue AS "CA",
+       total_commission AS "Commission"
+FROM analytics.daily_summary
+WHERE dt BETWEEN date_trunc('month', {REF_DAY})::date AND {REF_DAY}
+ORDER BY dt DESC""",
+        "viz": {},
+    },
+    "Commissions à facturer par vendeur (mois)": {
+        "display": "table",
+        "sql": f"""
+SELECT s.name AS "Vendeur", s.seller_id AS "ID",
+       sum(sd.orders) AS "Commandes", sum(sd.revenue) AS "CA", sum(sd.commission) AS "Commission"
+FROM analytics.seller_daily sd
+JOIN dwh.dim_seller s ON s.seller_id = sd.seller_id
+WHERE sd.dt BETWEEN date_trunc('month', {REF_DAY})::date AND {REF_DAY}
+GROUP BY s.name, s.seller_id
+ORDER BY "Commission" DESC""",
+        "viz": {},
+    },
+    # ------------------------------------------------------------------- Catégories
+    "Répartition du CA par catégorie (30 jours)": {
+        "display": "pie",
+        "sql": f"""
+SELECT category AS "Catégorie", sum(revenue) AS "CA"
+FROM analytics.category_daily
+WHERE dt > {REF_DAY} - 30
+GROUP BY category
+ORDER BY 2 DESC""",
+        "viz": {"pie.dimension": "Catégorie", "pie.metric": "CA", "pie.show_legend": True},
+    },
+    "CA hebdomadaire par catégorie": {
+        "display": "bar",
+        "sql": f"""
+SELECT date_trunc('week', dt)::date AS "Semaine", category AS "Catégorie", sum(revenue) AS "CA"
+FROM analytics.category_daily
+WHERE dt > {REF_DAY} - 28
+GROUP BY 1, 2
+ORDER BY 1, 2""",
+        "viz": {
+            "graph.dimensions": ["Semaine", "Catégorie"],
+            "graph.metrics": ["CA"],
+            "stackable.stack_type": "stacked",
+            "graph.y_axis.title_text": "CA (€)",
+        },
+    },
+    "Indicateurs par catégorie (30 jours)": {
+        "display": "table",
+        "sql": f"""
+SELECT category AS "Catégorie",
+       sum(orders) AS "Commandes",
+       sum(revenue) AS "CA",
+       round(sum(revenue) / NULLIF(sum(orders), 0), 2) AS "Panier moyen",
+       sum(revenue) / sum(sum(revenue)) OVER () AS "Part du CA"
+FROM analytics.category_daily
+WHERE dt > {REF_DAY} - 30
+GROUP BY category
+ORDER BY "CA" DESC""",
+        "viz": {"column_settings": {'["name","Part du CA"]': {"number_style": "percent", "decimals": 1}}},
+    },
 }
 
 # Grille Metabase : 24 colonnes.
@@ -162,6 +263,25 @@ DASHBOARDS = {
             ("Top 10 vendeurs du mois", 0, 0, 12, 9),
             ("CA des 3 meilleurs vendeurs sur 30 jours", 0, 12, 12, 9),
             ("Vendeurs inactifs depuis plus de 7 jours", 9, 0, 24, 8),
+        ],
+    },
+    "Commissions": {
+        "description": "Finance : commissions Maelys (12 % des commandes completed) pour la clôture et la facturation.",
+        "cards": [
+            ("Commission du mois", 0, 0, 8, 4),
+            ("CA commissionné du mois", 0, 8, 8, 4),
+            ("CA annulé ou remboursé du mois (non commissionné)", 0, 16, 8, 4),
+            ("Commissions par jour (30 jours)", 4, 0, 24, 7),
+            ("Récapitulatif des commissions par jour (mois)", 11, 0, 12, 9),
+            ("Commissions à facturer par vendeur (mois)", 11, 12, 12, 9),
+        ],
+    },
+    "Catégories": {
+        "description": "Catalogue : répartition et évolution du CA par catégorie (commandes completed).",
+        "cards": [
+            ("Répartition du CA par catégorie (30 jours)", 0, 0, 10, 9),
+            ("CA hebdomadaire par catégorie", 0, 10, 14, 9),
+            ("Indicateurs par catégorie (30 jours)", 9, 0, 24, 7),
         ],
     },
 }
