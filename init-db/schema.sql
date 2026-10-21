@@ -203,6 +203,17 @@ CREATE TABLE IF NOT EXISTS analytics.category_daily (
     PRIMARY KEY (dt, category)
 );
 
+-- Journal des recalculs des DAGs aval. source_loaded_at = version des faits utilisée
+-- (max(fact_orders.loaded_at) sur la fenêtre de la date) : une date est à recalculer
+-- dès que ses faits ont été rechargés depuis, même si un événement d'Asset a été perdu.
+CREATE TABLE IF NOT EXISTS analytics.refresh_log (
+    dag_id            TEXT        NOT NULL,
+    dt                DATE        NOT NULL,
+    source_loaded_at  TIMESTAMPTZ NOT NULL,
+    refreshed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (dag_id, dt)
+);
+
 -- Bonus : anomalies détectées (CA du jour < 70 % de la moyenne mobile 7 jours).
 CREATE TABLE IF NOT EXISTS analytics.anomalies (
     dt           DATE           NOT NULL,

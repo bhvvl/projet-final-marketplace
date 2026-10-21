@@ -2,7 +2,7 @@
 
 MVP de plateforme data : API backoffice → Airflow 3.1.8 → MinIO (raw) → PostgreSQL 18 (`staging` / `dwh` / `analytics`) → Metabase.
 
-Plan de travail : [PLAN.md](PLAN.md).
+Plan de travail : [PLAN.md](PLAN.md). Démarrage rapide : voir [Lancement](#lancement) (4 commandes depuis un clone neuf).
 
 ## Architecture
 
@@ -147,11 +147,16 @@ Passer à Slack ou Teams ne demande que de changer la Connection.
 
 ## DAG `marketplace_analytics_aggregate_daily`
 
-[dags/marketplace_analytics_aggregate_daily.py](dags/marketplace_analytics_aggregate_daily.py) : `resolve_dates`, puis `build_daily_summary`, `build_seller_daily` et `build_category_daily` en parallèle.
+[dags/marketplace_analytics_aggregate_daily.py](dags/marketplace_analytics_aggregate_daily.py) : `resolve_dates`, puis `build_daily_summary`, `build_seller_daily` et `build_category_daily` en parallèle, puis `mark_refreshed`.
 
-- **Déclenché par l'Asset** `fact_orders` (`schedule=[FACT_ORDERS_ASSET]`) : chaque ingestion réussie relance les agrégats.
-- **Quelle date recalculer ?** En Airflow 3, un run déclenché par Asset n'a pas de `logical_date`, et les événements reçus ne donnent pas la date du run source. Le DAG d'ingestion publie donc la date traitée dans l'`extra` de l'événement (`{"dt": "2026-10-19"}`), et `resolve_dates` la lit. Plusieurs événements regroupés (backfill) donnent plusieurs dates.
-- **Run manuel**, ou événement sans date : recalcul complet de toutes les dates de `fact_orders`.
+- **Déclenché par l'Asset** `fact_orders` (`schedule=[FACT_ORDERS_ASSET]`) : chaque ingestion réussie relance les agrégats. Le DAG est actif dès sa création.
+- **Quelle date recalculer ?** Elle est déduite de **l'état des données**, pas seulement des événements :
+  - **Pourquoi** : en Airflow 3, un run déclenché par Asset n'a pas de `logical_date`. Et pendant le test de reproductibilité, Airflow a **perdu** deux événements émis à quelques millisecondes d'intervalle (08/09 et 10/09, absents des agrégats).
+  - **Comment** : `analytics.refresh_log` enregistre, pour chaque DAG aval et chaque date, la version des faits utilisée (`max(fact_orders.loaded_at)`). Une date est recalculée dès que ses faits ont été rechargés depuis ([dags/marketplace/common.py](dags/marketplace/common.py), `dates_to_process`).
+  - **Conséquence** : un événement perdu est rattrapé au run suivant, et un déclenchement manuel rattrape tout ce qui est en retard.
+  - **Recalcul forcé** : `airflow dags trigger marketplace_analytics_aggregate_daily --conf '{"full_refresh": true}'`.
+  - L'ingestion publie toujours la date traitée dans l'`extra` de l'événement (`{"dt": …}`), mais seulement pour information dans les logs.
+- **Vérifié** : un premier déclenchement traite 51 dates, un second n'en traite aucune, et un rechargement du 08/09 sans événement est rattrapé seul.
 - `DELETE` + `INSERT` par date dans une transaction ([dags/sql/analytics_*.sql](dags/sql/)) : idempotent.
 - **Réconciliation** : le CA de `fact_orders` (commandes `completed`) est égal au centime près à celui de `daily_summary`, `seller_daily` et `category_daily`, ce que vérifie un test.
 
@@ -174,18 +179,26 @@ Passer à Slack ou Teams ne demande que de changer la Connection.
   - les 2 journées de chute simulées par l'API sont détectées (05/09 à 62 % de la moyenne, 14/09 à 47 %) ;
   - 206 prix suspects, environ 0,4 % des commandes, soit le taux de défauts injecté dans l'API ;
   - 133 chutes de CA vendeur.
-- ⚠️ **Après un backfill**, la référence sur 7 jours de certaines dates change. Relancer alors un recalcul complet : `airflow dags trigger marketplace_anomaly_detect_daily` (sans événement, toutes les dates sont recalculées).
+- **Dates à recalculer** : même mécanisme que pour les agrégats, avec une fenêtre de 7 jours. Une date est recalculée si ses faits **ou ceux des 7 jours précédents** (sa référence) ont changé. Après un backfill, les dates voisines sont donc recalculées automatiquement. Exemple : recharger le 08/09 relance la détection du 08/09 au 15/09.
 
 ## Backfill (rejouer des dates passées)
 
-Backfill Airflow 3, exécuté par le scheduler (le DAG doit être actif) :
+Le plus simple : [scripts/load_demo_data.sh](scripts/load_demo_data.sh) (`./scripts/load_demo_data.sh [DEBUT] [FIN]`, par défaut du 01/09 au 20/10/2026). Il est ré-exécutable :
+1. il active le DAG d'ingestion et lance le backfill (5 runs en parallèle). Les dates déjà chargées sont ignorées ; les runs **en échec sont rejoués**, donc relancer le script répare un backfill interrompu ;
+2. il remet le DAG d'ingestion en pause ;
+3. il déclenche une dernière fois les DAGs aval pour rattraper les dates en retard ;
+4. il configure Metabase.
+
+À la main, c'est un backfill Airflow 3 exécuté par le scheduler (le DAG doit être actif) :
 
 ```bash
 docker compose exec airflow-worker airflow backfill create --dag-id marketplace_orders_ingest_daily \
-  --from-date 2026-09-21 --to-date 2026-10-20 --dry-run   # puis sans --dry-run
+  --from-date 2026-09-01 --to-date 2026-10-20 --reprocess-behavior failed --dry-run   # puis sans --dry-run
 ```
 
-Exécuté en deux fois, du 21/09 au 20/10, puis du 01/09 au 20/09/2026 : 50 runs en succès. `fact_orders` contient 52 936 commandes sur 51 dates (avec le 07/04), pour 6,98 M€ de CA. Chaque run émet un événement d'Asset, qui relance les agrégats et la détection d'anomalies.
+Résultat : 50 runs en succès. `fact_orders` contient 52 936 commandes sur 51 dates (avec le 07/04), pour 6 979 609,21 € de CA. Les chiffres sont identiques avant et après une remise à zéro complète, puisque l'API est déterministe.
+
+> ⚠️ Docker Desktop est suspendu quand le Mac se met en veille (capot fermé). Les tâches en cours échouent alors au réveil (`Invalid auth token: Signature has expired`, `dagrun_timeout`). Il suffit de relancer `./scripts/load_demo_data.sh`.
 
 ## Metabase
 
@@ -269,21 +282,26 @@ Tout est versionné et chargé au démarrage, sans import manuel à refaire :
 docker compose exec airflow-worker pytest tests/ -v
 ```
 
-40 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
+41 tests. Ceux qui interrogent l'API ou le DWH du compose sont ignorés (`skip`) s'ils ne sont pas joignables ou vides.
 
 | Fichier | Tests |
 |---|---|
-| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion et branchement qualité ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; DAGs analytics et anomalies (planification par Asset, SQL idempotents, lecture de la date dans l'`extra`, branchement de notification) ; réconciliation des agrégats avec `fact_orders` |
+| [tests/test_dags.py](tests/test_dags.py) | Les 3 tests demandés : `test_no_import_errors`, `test_all_dags_catchup_false`, `test_marketplace_ingest_has_idempotent_transform` (DELETE avant INSERT sur `{{ ds }}`, aucune date en dur, une seule transaction). En plus : structure du DAG d'ingestion et branchement qualité ; `test_transform_is_idempotent_on_dwh`, qui joue 2 fois la transformation sur le DWH et compare les empreintes ; DAGs analytics et anomalies (planification par Asset, SQL idempotents, branchement de notification) ; choix des dates à recalculer, avec la base mockée puis sur le DWH (une date rechargée après son dernier calcul est détectée) ; réconciliation des agrégats avec `fact_orders` |
 | [tests/test_data_quality_operator.py](tests/test_data_quality_operator.py) | 11 tests du `DataQualityOperator`, base de données mockée : règles OK et KO, SQL généré, `fail_on_error`, configurations invalides rejetées |
 | [tests/test_marketplace_api_hook.py](tests/test_marketplace_api_hook.py) | 12 tests du Hook |
 
 ## Lancement
 
+Depuis un clone neuf (testé après `docker compose down -v` et `git clean -xfd`) :
+
 ```bash
-cp .env.example .env   # puis générer les 3 secrets Airflow (voir commentaires)
-docker compose up -d --build
-docker compose ps      # attendre ~1-2 min que tout soit healthy
+./scripts/init_env.sh          # crée .env depuis .env.example, avec des secrets Airflow générés
+docker compose up -d --build   # environ 1 minute (images en cache) ; le schéma DWH est créé au premier démarrage
+docker compose ps              # attendre que tout soit healthy
+./scripts/load_demo_data.sh    # 50 jours de données, agrégats, anomalies et dashboards Metabase
 ```
+
+Grafana se configure tout seul au démarrage. Le DAG d'ingestion est **en pause** après installation, pour que le test du formateur (`airflow dags test …`) fonctionne. Les DAGs analytics et anomalies sont actifs. Pour une exploitation quotidienne, activer l'ingestion dans l'UI ou avec `airflow dags unpause marketplace_orders_ingest_daily`.
 
 | Service | URL / accès | Identifiants |
 |---|---|---|

@@ -125,7 +125,10 @@ def test_analytics_is_triggered_by_fact_orders_asset(analytics_dag):
     uris = [asset.uri for _, asset in analytics_dag.timetable.asset_condition.iter_assets()]
     assert uris == ["postgres://postgres-dwh:5432/dwh/dwh/fact_orders"]
     assert set(analytics_dag.task_ids) == {
-        "resolve_dates", "build_daily_summary", "build_seller_daily", "build_category_daily"
+        "resolve_dates", "build_daily_summary", "build_seller_daily", "build_category_daily", "mark_refreshed"
+    }
+    assert analytics_dag.get_task("mark_refreshed").upstream_task_ids >= {
+        "build_daily_summary", "build_seller_daily", "build_category_daily"
     }
 
 
@@ -138,14 +141,47 @@ def test_analytics_sql_is_idempotent(sql_file, table):
     assert delete and insert and delete.start() < insert.start()
 
 
-def test_resolve_dates_reads_dt_from_asset_events(analytics_dag):
+def test_dates_to_process_queries_stale_dates():
     from types import SimpleNamespace
+    from unittest import mock
 
-    resolve = analytics_dag.get_task("resolve_dates").python_callable
-    asset = analytics_dag.timetable.asset_condition
-    events = {asset: [SimpleNamespace(extra={"dt": "2026-10-19"}), SimpleNamespace(extra={"dt": "2026-10-18"})]}
+    from marketplace.common import dates_to_process
 
-    assert resolve(triggering_asset_events=events) == ["2026-10-18", "2026-10-19"]
+    rows = [("2026-10-18", "2026-10-21 10:00:00+00"), ("2026-10-19", "2026-10-21 10:05:00+00")]
+    context = {"triggering_asset_events": {"asset": [SimpleNamespace(extra={"dt": "2026-10-19"})]},
+               "params": {"full_refresh": True}}
+    with mock.patch("airflow.providers.postgres.hooks.postgres.PostgresHook.get_records",
+                    return_value=rows) as get_records:
+        result = dates_to_process(context, dag_id="some_dag", lookback_days=7)
+
+    assert result == {"dates": ["2026-10-18", "2026-10-19"], "versions": dict(rows)}
+    assert get_records.call_args.kwargs["parameters"] == {"dag_id": "some_dag", "lookback_days": 7, "full_refresh": True}
+
+
+def test_refresh_log_detects_reloaded_dates_on_dwh():
+    """Une date dont les faits sont plus récents que son dernier calcul est à recalculer (DWH du compose)."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    from marketplace.common import dates_to_process, mark_refreshed
+
+    hook = PostgresHook(postgres_conn_id="postgres_dwh")
+    probe = "pytest_probe"
+    try:
+        row = hook.get_first("SELECT max(dt)::text, max(loaded_at)::text FROM dwh.fact_orders "
+                             "WHERE dt = (SELECT max(dt) FROM dwh.fact_orders)")
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"DWH injoignable : {exc}")
+    if row[0] is None:
+        pytest.skip("dwh.fact_orders vide")
+    dt, loaded_at = row
+    try:
+        mark_refreshed(probe, {dt: "2000-01-01 00:00:00+00"})  # calculé avant le dernier chargement
+        assert dt in dates_to_process({}, dag_id=probe)["dates"]
+
+        mark_refreshed(probe, {dt: loaded_at})  # calculé avec la version courante
+        assert dt not in dates_to_process({}, dag_id=probe)["dates"]
+    finally:
+        hook.run("DELETE FROM analytics.refresh_log WHERE dag_id = %s", parameters=(probe,))
 
 
 def test_analytics_reconciles_with_fact_orders():

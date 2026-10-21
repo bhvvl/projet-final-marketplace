@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,26 +65,65 @@ def send_alert(kind: str, message: str, details: Any = None) -> None:
     )
 
 
-def dates_to_process(context) -> list[str]:
-    """Dates à recalculer par un DAG déclenché par l'Asset fact_orders.
+STALE_DATES_SQL = """
+WITH loaded AS (
+    SELECT dt, max(loaded_at) AS loaded_at FROM dwh.fact_orders GROUP BY dt
+),
+windowed AS (
+    SELECT target.dt, max(source.loaded_at) AS source_loaded_at
+    FROM loaded target
+    JOIN loaded source ON source.dt BETWEEN target.dt - %(lookback_days)s AND target.dt
+    GROUP BY target.dt
+)
+SELECT w.dt::text, w.source_loaded_at::text
+FROM windowed w
+LEFT JOIN analytics.refresh_log r ON r.dag_id = %(dag_id)s AND r.dt = w.dt
+WHERE %(full_refresh)s OR r.source_loaded_at IS NULL OR w.source_loaded_at > r.source_loaded_at
+ORDER BY 1
+"""
 
-    Un run déclenché par Asset n'a pas de logical_date (Airflow 3) : les dates sont lues dans
-    l'extra {"dt": ...} des événements (plusieurs événements possibles, ex. backfill).
-    Run manuel, ou événement sans dt : toutes les dates présentes dans dwh.fact_orders.
+
+def dates_to_process(context, dag_id: str, lookback_days: int = 0) -> dict[str, Any]:
+    """Dates à recalculer par un DAG aval de fact_orders, déduites de l'état des données.
+
+    Une date est à recalculer si ses faits, ou ceux des lookback_days jours précédents dont
+    elle dépend, ont été rechargés depuis son dernier calcul (analytics.refresh_log).
+    On ne se fie pas seulement aux événements d'Asset : Airflow peut regrouper ou perdre des
+    événements émis à quelques millisecondes d'intervalle (constaté pendant un backfill),
+    et un run manuel n'en a pas. Avec params.full_refresh, toutes les dates sont recalculées.
+
+    Retourne {"dates": [...], "versions": {dt: source_loaded_at}} pour mark_refreshed().
     """
-    events = [e for asset_events in (context.get("triggering_asset_events") or {}).values() for e in asset_events]
-    dates = {(event.extra or {}).get("dt") for event in events}
-    if events and None not in dates:
-        print(f"{len(events)} événement(s) d'Asset : {sorted(dates)}")
-        return sorted(dates)
-
     from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+    events = [e for asset_events in (context.get("triggering_asset_events") or {}).values() for e in asset_events]
+    announced = sorted({(e.extra or {}).get("dt") for e in events} - {None})
+    full_refresh = bool((context.get("params") or {}).get("full_refresh"))
+
     rows = PostgresHook(postgres_conn_id=DWH_CONN_ID).get_records(
-        "SELECT DISTINCT dt::text FROM dwh.fact_orders ORDER BY 1"
+        STALE_DATES_SQL,
+        parameters={"dag_id": dag_id, "lookback_days": lookback_days, "full_refresh": full_refresh},
     )
-    print(f"Pas de date dans les événements d'Asset : recalcul complet ({len(rows)} dates)")
-    return [row[0] for row in rows]
+    versions = dict(rows)
+    print(f"Événements d'Asset : {announced or 'aucun'} ; full_refresh={full_refresh} ; "
+          f"{len(versions)} date(s) à recalculer : {sorted(versions)}")
+    return {"dates": sorted(versions), "versions": versions}
+
+
+def mark_refreshed(dag_id: str, versions: dict[str, str]) -> None:
+    """Enregistre la version des faits utilisée pour chaque date recalculée."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    if not versions:
+        return
+    now = datetime.now(timezone.utc)
+    PostgresHook(postgres_conn_id=DWH_CONN_ID).insert_rows(
+        "analytics.refresh_log",
+        [(dag_id, dt, loaded_at, now) for dt, loaded_at in versions.items()],
+        target_fields=["dag_id", "dt", "source_loaded_at", "refreshed_at"],
+        replace=True,
+        replace_index=["dag_id", "dt"],
+    )
 
 
 def read_sql(name: str) -> str:
